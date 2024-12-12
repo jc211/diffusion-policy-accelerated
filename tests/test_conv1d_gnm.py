@@ -1,17 +1,18 @@
 import unittest
 import torch
-import torch.nn as nn
 
 from diffusion_policy_accelerated import config
 from diffusion_policy_accelerated.diffusion_policy.model import Conv1dBlock
+
+DEVICE = "cuda:0"
 
 class TestConv1dGNMBlock(unittest.TestCase):
     def test_conv1d_block(self):
         for out_channels, in_channels, length in config.TENSOR_SHAPES:
             with self.subTest(out_channels=out_channels, in_channels=in_channels, length=length):
-                block = Conv1dBlock(in_channels, out_channels, kernel_size=5, n_groups=8).to(config.DEVICE)
+                block = Conv1dBlock(in_channels, out_channels, kernel_size=5, n_groups=8).to(DEVICE)
 
-                x = torch.randn(1, in_channels, length, device=config.DEVICE)
+                x = torch.randn(1, in_channels, length, device=DEVICE)
 
                 config.inference_mode = config.InferenceMode.NORMAL
                 normal_output = block(x)

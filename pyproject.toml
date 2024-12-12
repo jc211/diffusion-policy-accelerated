@@ -1,0 +1,31 @@
+[project]
+name = "diffusion_policy_accelerated"
+version = "1.5"
+authors = [
+    {name = "Vrushank Desai", email = "vrushank@vrushankdes.ai"},
+]
+description = "A library to showcase the use of custom CUDA extensions & CUDA graphs to accelerate the inference of Diffusion Policy."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch", "numpy"]
+
+[tool.setuptools.packages.find]
+include = ['diffusion_policy_accelerated', 'diffusion_policy_accelerated.*'] 
+
+[build-system]
+requires = ["setuptools", "torch"]
+build-backend = "setuptools.build_meta"
+
+[tool.pixi.dependencies]
+"cuda-nvcc" = "12.*"
+"libcusparse" = "12.*"
+
+[tool.pixi.project]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.pypi-dependencies]
+diffusion_policy_accelerated = { path = ".", editable = true }
+
+[system-requirements]
+cuda = "12"

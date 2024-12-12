@@ -1,22 +1,11 @@
-from typing import Tuple, Sequence, Dict, Union, Optional, Callable
+from typing import Union
 import math
 
 import torch
 import torch.nn as nn
-from torch.utils.cpp_extension import load
-import numpy as np 
-import torch
-import torch.nn as nn
-import torchvision
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-from diffusers.training_utils import EMAModel
-from diffusers.optimization import get_scheduler
-from torch.profiler import profile, record_function, ProfilerActivity
-from tqdm.auto import tqdm
 
 import diffusion_policy_accelerated.config as config 
 import diffusion_policy_accelerated.conv1d_gnm as conv1d_gnm
-import diffusion_policy_accelerated.denoise as denoise
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -207,13 +196,11 @@ class ConditionalUnet1D(nn.Module):
         self.down_modules = down_modules
         self.final_conv = final_conv
 
-        self.diffusion_constants = generate_diffusion_constants()
 
     def forward(self,
             sample: torch.Tensor,
             timestep: Union[torch.Tensor, float, int],
-            global_cond=None,
-            diffusion_noise=None):
+            global_cond=None):
         """
         x: (B,T,input_dim)
         timestep: (B,) or int, diffusion step
@@ -258,172 +245,7 @@ class ConditionalUnet1D(nn.Module):
 
         x = self.final_conv(x)
 
-        if config.INFERENCE_MODE == config.InferenceMode.ACCELERATED:
-            x = denoise.denoise(x, sample, self.diffusion_constants, timestep, diffusion_noise)
-        
         # (B,C,T)
         x = x.moveaxis(-1,-2)
         # (B,T,C)
         return x
-
-def get_resnet(name:str, weights=None, **kwargs) -> nn.Module:
-    """
-    name: resnet18, resnet34, resnet50
-    weights: "IMAGENET1K_V1", None
-    """
-    # Use standard ResNet implementation from torchvision
-    func = getattr(torchvision.models, name)
-    resnet = func(weights=weights, **kwargs)
-
-    # remove the final fully connected layer
-    # for resnet18, the output dim should be 512
-    resnet.fc = torch.nn.Identity()
-    return resnet
-
-
-def replace_submodules(
-        root_module: nn.Module,
-        predicate: Callable[[nn.Module], bool],
-        func: Callable[[nn.Module], nn.Module]) -> nn.Module:
-    """
-    Replace all submodules selected by the predicate with
-    the output of func.
-
-    predicate: Return true if the module is to be replaced.
-    func: Return new module to use.
-    """
-    if predicate(root_module):
-        return func(root_module)
-
-    bn_list = [k.split('.') for k, m
-        in root_module.named_modules(remove_duplicate=True)
-        if predicate(m)]
-    for *parent, k in bn_list:
-        parent_module = root_module
-        if len(parent) > 0:
-            parent_module = root_module.get_submodule('.'.join(parent))
-        if isinstance(parent_module, nn.Sequential):
-            src_module = parent_module[int(k)]
-        else:
-            src_module = getattr(parent_module, k)
-        tgt_module = func(src_module)
-        if isinstance(parent_module, nn.Sequential):
-            parent_module[int(k)] = tgt_module
-        else:
-            setattr(parent_module, k, tgt_module)
-    # verify that all modules are replaced
-    bn_list = [k.split('.') for k, m
-        in root_module.named_modules(remove_duplicate=True)
-        if predicate(m)]
-    assert len(bn_list) == 0
-    return root_module
-
-def replace_bn_with_gn(
-    root_module: nn.Module,
-    features_per_group: int=16) -> nn.Module:
-    """
-    Relace all BatchNorm layers with GroupNorm.
-    """
-    replace_submodules(
-        root_module=root_module,
-        predicate=lambda x: isinstance(x, nn.BatchNorm2d),
-        func=lambda x: nn.GroupNorm(
-            num_groups=x.num_features//features_per_group,
-            num_channels=x.num_features)
-    )
-    return root_module
-
-def load_noise_pred_net_graph(noise_pred_net):
-    '''
-    Preloads a CUDA graph for the noise prediction network for accelerated inference.
-    
-    This function initializes static inputs for the noise prediction network, compiles the network for these inputs,
-    and captures the execution in a CUDA graph for rapid replay during inference.
-    
-    Parameters:
-    - noise_pred_net (nn.Module): The noise prediction network to be accelerated.
-    
-    Returns:
-    - tuple: A tuple containing the CUDA graph and static inputs for rapid inference replay.
-    '''
-
-    static_noisy_action = torch.randn((1, config.PRED_HORIZON, config.ACTION_DIM), requires_grad=False, device=config.DEVICE)
-    static_obs_cond = torch.randn((1, config.IMG_EMBEDDING_DIM), requires_grad=False, device=config.DEVICE)
-    static_k = torch.tensor(0, requires_grad=False, device=config.DEVICE)
-    static_diffusion_noise = torch.randn((1, config.PRED_HORIZON, config.ACTION_DIM), device=config.DEVICE)
-    compiled_net = torch.compile(noise_pred_net)
-
-    torch.cuda.synchronize()
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s), torch.no_grad():
-        for _ in range(3):
-            _ = compiled_net(
-                static_noisy_action,
-                static_k,
-                static_obs_cond,
-                static_diffusion_noise
-            )
-    torch.cuda.current_stream().wait_stream(s)
-
-    u_net_graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(u_net_graph), torch.no_grad():
-        static_model_output = compiled_net(
-            static_noisy_action,
-            static_k,
-            static_obs_cond,
-            static_diffusion_noise
-        )
-    
-    return u_net_graph, static_noisy_action, static_k, static_obs_cond, static_diffusion_noise, static_model_output
-
-def generate_diffusion_constants():
-    """
-    Generates diffusion constants for the diffusion process. See https://arxiv.org/abs/2006.11239 for more details.
-
-    Returns:
-        torch.Tensor: A tensor containing all the computed diffusion constants, reshaped and moved to the CUDA device.
-    """
-
-    noise_scheduler = DDPMScheduler(
-        num_train_timesteps=config.NUM_DIFFUSION_ITERS,
-        beta_schedule='squaredcos_cap_v2',
-        clip_sample=True,
-        prediction_type='epsilon'
-    )
-
-    alpha_prod = noise_scheduler.alphas_cumprod
-    sqrt_alpha_prod = torch.sqrt(alpha_prod)
-    alpha_prod_prev = torch.cat([torch.tensor([1]), alpha_prod[:-1]])
-    beta_prod_prev = 1 - alpha_prod_prev
-    beta_prod = 1 - alpha_prod
-    sqrt_beta_prod = torch.sqrt(beta_prod)
-    alpha_t = alpha_prod / alpha_prod_prev
-    beta_t = 1 - alpha_t
-    pred_original_sample_coeff = ((alpha_prod_prev**0.5) * beta_t)/beta_prod
-    sample_coeff = ((alpha_t**0.5) * beta_prod_prev)/beta_prod
-    variance = torch.sqrt((1 - alpha_prod_prev) / (1 - alpha_prod) * beta_t)
-
-    stacked_tensor = torch.stack([
-        sqrt_beta_prod, 
-        sqrt_alpha_prod, 
-        sample_coeff, 
-        pred_original_sample_coeff,
-        variance
-    ], dim=0)
-
-    diffusion_constants = stacked_tensor.transpose(0, 1).contiguous().reshape(-1).to('cuda')
-
-    return diffusion_constants
-
-def normalize_data(data, stats):
-    # nomalize to [0,1]
-    ndata = (data - stats['min']) / (stats['max'] - stats['min'])
-    # normalize to [-1, 1]
-    ndata = ndata * 2 - 1
-    return ndata
-
-def unnormalize_data(ndata, stats):
-    ndata = (ndata + 1) / 2
-    data = ndata * (stats['max'] - stats['min']) + stats['min']
-    return data
