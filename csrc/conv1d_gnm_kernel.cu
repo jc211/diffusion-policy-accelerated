@@ -184,7 +184,10 @@ torch::Tensor conv1d_gnm_cuda(
     auto gnm_out = torch::empty({1, output_channels, output_length}, options);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    if (input_channels == 2 && input_length == 16) {
+    if (input_channels == 2 && input_length == 32) {
+        const dim3 conv1d_threads(input_channels / 1, 1, 1);
+        conv1d<2, 32, 2, 5, 1><<<conv1d_blocks, conv1d_threads, 0, stream>>>(d_input, d_conv1d_weight, d_conv1d_bias, conv1d_out.data_ptr<float>());
+    } else if (input_channels == 2 && input_length == 16) {
         const dim3 conv1d_threads(input_channels / 1, 1, 1);
         conv1d<2, 16, 2, 5, 1><<<conv1d_blocks, conv1d_threads, 0, stream>>>(d_input, d_conv1d_weight, d_conv1d_bias, conv1d_out.data_ptr<float>());
     } else if (input_channels == 512 && input_length == 4) {
@@ -208,6 +211,8 @@ torch::Tensor conv1d_gnm_cuda(
     } else if (input_channels == 2048 && input_length == 4) {
         const dim3 conv1d_threads(input_channels / 4, 1, 1);
         conv1d<2048, 4, 2, 5, 4><<<conv1d_blocks, conv1d_threads, 0, stream>>>(d_input, d_conv1d_weight, d_conv1d_bias, conv1d_out.data_ptr<float>());
+    } else {
+        throw std::invalid_argument("Input shape is not supported.");
     }
 
     cudaError_t conv1d_err = cudaGetLastError();
